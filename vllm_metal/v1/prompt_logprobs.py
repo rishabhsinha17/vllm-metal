@@ -112,10 +112,6 @@ class PromptLogprobsTracker:
         """Whether *req_id* still needs prompt logprobs."""
         return req_id in self._active
 
-    def num_logprobs(self, req_id: str) -> int:
-        """Return the request's configured prompt-logprobs count."""
-        return self._active[req_id]
-
     def observe_chunk(
         self,
         req_id: str,
@@ -124,7 +120,6 @@ class PromptLogprobsTracker:
         start_pos: int,
         num_tokens: int,
         chunk_logits: mx.array,
-        num_logprobs: int,
         logprobs_mode: str,
     ) -> LogprobsTensors | None:
         """Score one prefill chunk's logits rows against the prompt.
@@ -148,7 +143,7 @@ class PromptLogprobsTracker:
             accumulator = PromptLogprobsAccumulator(
                 prompt_len=prompt_len,
                 num_logprobs=_resolve_num_logprobs(
-                    num_logprobs, int(chunk_logits.shape[-1])
+                    self._active[req_id], int(chunk_logits.shape[-1])
                 ),
             )
             self._in_progress[req_id] = accumulator

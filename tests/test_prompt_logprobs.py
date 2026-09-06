@@ -168,7 +168,6 @@ class TestPromptLogprobsTracker:
             start_pos=0,
             num_tokens=3,
             chunk_logits=full_rows[0:3],
-            num_logprobs=1,
             logprobs_mode="raw_logprobs",
         )
         assert first is None
@@ -179,7 +178,6 @@ class TestPromptLogprobsTracker:
             start_pos=3,
             num_tokens=3,
             chunk_logits=full_rows[3:6],
-            num_logprobs=1,
             logprobs_mode="raw_logprobs",
         )
         assert final is not None
@@ -201,6 +199,7 @@ class TestPromptLogprobsTracker:
         from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 
         tracker = PromptLogprobsTracker()
+        tracker.register("req-b", 0)
         prompt = [2, 0, 1]
         rows = mx.array(
             [[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]], dtype=mx.float32
@@ -212,7 +211,6 @@ class TestPromptLogprobsTracker:
             start_pos=0,
             num_tokens=3,
             chunk_logits=rows,
-            num_logprobs=0,
             logprobs_mode="raw_logprobs",
         )
 
@@ -225,13 +223,13 @@ class TestPromptLogprobsTracker:
         from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 
         tracker = PromptLogprobsTracker()
+        tracker.register("req-c", 2)
         tensors = tracker.observe_chunk(
             "req-c",
             prompt_token_ids=[5],
             start_pos=0,
             num_tokens=1,
             chunk_logits=mx.zeros((1, 8)),
-            num_logprobs=2,
             logprobs_mode="raw_logprobs",
         )
 
@@ -242,6 +240,7 @@ class TestPromptLogprobsTracker:
         from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 
         tracker = PromptLogprobsTracker()
+        tracker.register("req-d", 1)
         with pytest.raises(ValueError, match=r"\(3, vocab\)"):
             tracker.observe_chunk(
                 "req-d",
@@ -249,7 +248,6 @@ class TestPromptLogprobsTracker:
                 start_pos=0,
                 num_tokens=3,
                 chunk_logits=mx.zeros((2, 8)),
-                num_logprobs=1,
                 logprobs_mode="raw_logprobs",
             )
 
@@ -264,7 +262,6 @@ class TestPromptLogprobsTracker:
             start_pos=0,
             num_tokens=2,
             chunk_logits=mx.zeros((2, 8)),
-            num_logprobs=1,
             logprobs_mode="raw_logprobs",
         )
         assert "req-e" in tracker._in_progress

@@ -1942,7 +1942,6 @@ class MetalModelRunner:
         for i, prefill in enumerate(prefill_reqs):
             if not self._prompt_logprobs_tracker.wants(prefill.req_id):
                 continue
-            num_logprobs = self._prompt_logprobs_tracker.num_logprobs(prefill.req_id)
             if logits is None:
                 raise RuntimeError(
                     "Prompt logprobs requested but the forward produced no "
@@ -1969,7 +1968,6 @@ class MetalModelRunner:
                 start_pos=prefill.start_pos,
                 num_tokens=len(prefill.token_ids),
                 chunk_logits=logits[0, seg_start:seg_end, :],
-                num_logprobs=num_logprobs,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
             if tensors is not None:
