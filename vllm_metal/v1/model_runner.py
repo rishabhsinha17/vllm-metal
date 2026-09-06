@@ -1100,6 +1100,7 @@ class MetalModelRunner:
                 logits[0],
                 token_ids,
                 sampling_params.prompt_logprobs,
+                logprobs_mode=self.model_config.logprobs_mode,
             )
 
         # Extract last token logits
@@ -1466,7 +1467,7 @@ class MetalModelRunner:
                 # projection-free intermediate forward (no logits at all) and
                 # the selective layout (last prefill row only).
                 needs_prompt_logprob_rows = any(
-                    PromptLogprobsTracker.wants(pr.sampling_params)
+                    self._prompt_logprobs_tracker.wants(pr.req_id)
                     for pr in prefill_reqs
                 )
                 if (
@@ -1614,7 +1615,7 @@ class MetalModelRunner:
                 and SamplingBatch.params_allow_native_random(decode_params)
             ),
             has_prompt_logprobs=any(
-                sp.prompt_logprobs is not None for sp in decode_params
+                self._prompt_logprobs_tracker.wants(req_id) for req_id in decode_req_ids
             ),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
@@ -1939,10 +1940,9 @@ class MetalModelRunner:
         (``ModelRunnerOutput.prompt_logprobs_dict``).
         """
         for i, prefill in enumerate(prefill_reqs):
-            if not PromptLogprobsTracker.wants(prefill.sampling_params):
+            if not self._prompt_logprobs_tracker.wants(prefill.req_id):
                 continue
-            num_logprobs = prefill.sampling_params.prompt_logprobs
-            assert num_logprobs is not None
+            num_logprobs = self._prompt_logprobs_tracker.num_logprobs(prefill.req_id)
             if logits is None:
                 raise RuntimeError(
                     "Prompt logprobs requested but the forward produced no "
@@ -1970,6 +1970,7 @@ class MetalModelRunner:
                 num_tokens=len(prefill.token_ids),
                 chunk_logits=logits[0, seg_start:seg_end, :],
                 num_logprobs=num_logprobs,
+                logprobs_mode=self.model_config.logprobs_mode,
             )
             if tensors is not None:
                 batch.prompt_logprobs_dict[prefill.req_id] = tensors
@@ -2392,6 +2393,10 @@ class MetalModelRunner:
             generator = _create_request_generator(sampling_params)
 
             if self._paged_attention_runtime is not None:
+                if sampling_params.prompt_logprobs is not None:
+                    self._prompt_logprobs_tracker.register(
+                        req_id, sampling_params.prompt_logprobs
+                    )
                 sched_block_ids = self._copy_paged_block_ids(new_req.block_ids)
                 if self._paged_state_group_indices:
                     self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
@@ -2625,7 +2630,7 @@ class MetalModelRunner:
             needs_full_prompt = (
                 prefill.start_pos > 0
                 or self._is_mm_request(prefill.req_id)
-                or PromptLogprobsTracker.wants(prefill.sampling_params)
+                or self._prompt_logprobs_tracker.wants(prefill.req_id)
             )
             if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)

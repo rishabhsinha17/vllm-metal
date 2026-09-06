@@ -23,6 +23,8 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
+_LOGITS_LOGPROBS_MODES = ("raw_logits", "processed_logits")
+
 
 @dataclass(frozen=True, slots=True)
 class PromptLogprobsWindow:
@@ -90,25 +92,29 @@ class PromptLogprobsAccumulator:
 
 
 class PromptLogprobsTracker:
-    """In-progress prompt-logprobs accumulators keyed by request id.
+    """Active prompt-logprobs requests keyed by request id.
 
-    One instance lives on the runner.  Every prefill chunk of a request whose
-    ``SamplingParams.prompt_logprobs`` is set is observed exactly once, with
-    the logits rows the model produced for that chunk; the tracker scores the
-    rows that target prompt tokens and returns the request's completed
-    ``LogprobsTensors`` on the chunk that finishes the prompt (``None``
-    before that).  State survives preemption on purpose — a resumed request
-    re-runs its prompt chunks and overwrites the same positions — and is
-    dropped via :meth:`discard` when the engine finishes the request.
+    ``SamplingParams.prompt_logprobs`` stays on the request for its full
+    lifetime, but vLLM expects prompt logprobs exactly once.  The runner
+    registers each new request here, clears it after delivery, and keeps
+    in-progress chunks across prompt-stage preemption.
     """
 
     def __init__(self) -> None:
+        self._active: dict[str, int] = {}
         self._in_progress: dict[str, PromptLogprobsAccumulator] = {}
 
-    @staticmethod
-    def wants(sampling_params: object) -> bool:
-        """Whether *sampling_params* asks for prompt logprobs."""
-        return getattr(sampling_params, "prompt_logprobs", None) is not None
+    def register(self, req_id: str, num_logprobs: int) -> None:
+        """Track one request until its prompt logprobs are delivered."""
+        self._active[req_id] = num_logprobs
+
+    def wants(self, req_id: str) -> bool:
+        """Whether *req_id* still needs prompt logprobs."""
+        return req_id in self._active
+
+    def num_logprobs(self, req_id: str) -> int:
+        """Return the request's configured prompt-logprobs count."""
+        return self._active[req_id]
 
     def observe_chunk(
         self,
@@ -119,6 +125,7 @@ class PromptLogprobsTracker:
         num_tokens: int,
         chunk_logits: mx.array,
         num_logprobs: int,
+        logprobs_mode: str,
     ) -> LogprobsTensors | None:
         """Score one prefill chunk's logits rows against the prompt.
 
@@ -139,7 +146,10 @@ class PromptLogprobsTracker:
         accumulator = self._in_progress.get(req_id)
         if accumulator is None:
             accumulator = PromptLogprobsAccumulator(
-                prompt_len=prompt_len, num_logprobs=num_logprobs
+                prompt_len=prompt_len,
+                num_logprobs=_resolve_num_logprobs(
+                    num_logprobs, int(chunk_logits.shape[-1])
+                ),
             )
             self._in_progress[req_id] = accumulator
         if window.num_logits > 0:
@@ -150,16 +160,19 @@ class PromptLogprobsTracker:
                 chunk_logits[: window.num_logits],
                 targets,
                 accumulator.num_logprobs,
+                logprobs_mode=logprobs_mode,
             )
             accumulator.fill(window, chunk)
         if not window.completes:
             return None
         del self._in_progress[req_id]
+        self._active.pop(req_id, None)
         return accumulator.tensors
 
     def discard(self, req_ids: set[str] | list[str]) -> None:
-        """Drop in-progress state for finished or aborted requests."""
+        """Drop prompt-logprobs state for finished or aborted requests."""
         for req_id in req_ids:
+            self._active.pop(req_id, None)
             self._in_progress.pop(req_id, None)
 
 
@@ -167,6 +180,8 @@ def full_prompt_logprobs(
     logits_rows: mx.array,
     prompt_token_ids: list[int],
     num_logprobs: int,
+    *,
+    logprobs_mode: str,
 ) -> LogprobsTensors:
     """One-shot prompt logprobs when the whole prompt ran in one forward.
 
@@ -178,22 +193,32 @@ def full_prompt_logprobs(
     window = prompt_logprobs_window(
         start_pos=0, num_tokens=prompt_len, prompt_len=prompt_len
     )
+    num_logprobs = _resolve_num_logprobs(num_logprobs, int(logits_rows.shape[-1]))
     accumulator = PromptLogprobsAccumulator(
         prompt_len=prompt_len, num_logprobs=num_logprobs
     )
     if window.num_logits > 0:
         targets = prompt_token_ids[1 : 1 + window.num_logits]
         chunk = gather_prompt_logprobs(
-            logits_rows[: window.num_logits], targets, num_logprobs
+            logits_rows[: window.num_logits],
+            targets,
+            num_logprobs,
+            logprobs_mode=logprobs_mode,
         )
         accumulator.fill(window, chunk)
     return accumulator.tensors
+
+
+def _resolve_num_logprobs(num_logprobs: int, vocab_size: int) -> int:
+    return vocab_size if num_logprobs == -1 else num_logprobs
 
 
 def gather_prompt_logprobs(
     logits_rows: mx.array,
     target_token_ids: list[int],
     num_logprobs: int,
+    *,
+    logprobs_mode: str = "raw_logprobs",
 ) -> LogprobsTensors:
     """Score ``target_token_ids`` against ``logits_rows`` (one row per target).
 
@@ -209,6 +234,10 @@ def gather_prompt_logprobs(
         )
     mx.eval(logits_rows)
     logits = mlx_to_torch(logits_rows.astype(mx.float32), device="cpu")
-    logprobs = Sampler.compute_logprobs(logits)
+    scores = (
+        logits
+        if logprobs_mode in _LOGITS_LOGPROBS_MODES
+        else Sampler.compute_logprobs(logits)
+    )
     targets = torch.tensor(target_token_ids, dtype=torch.int64)
-    return Sampler.gather_logprobs(logprobs, num_logprobs, targets)
+    return Sampler.gather_logprobs(scores, num_logprobs, targets)
