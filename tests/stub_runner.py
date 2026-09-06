@@ -63,6 +63,7 @@ def make_stub_runner(
         "model_config": SimpleNamespace(
             runner_type="generate",
             get_head_size=lambda: 128,
+            logprobs_mode="raw_logprobs",
             max_model_len=2048,
             is_hybrid=is_hybrid,
         ),

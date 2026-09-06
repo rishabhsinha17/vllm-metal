@@ -84,6 +84,27 @@ class TestGatherPromptLogprobs:
         assert tensors.logprob_token_ids.tolist() == [[2]]
         assert tensors.selected_token_ranks.tolist() == [2]
 
+    def test_full_vocab_count_keeps_every_token(self) -> None:
+        logits = mx.array([[0.0, 1.0, 2.0]], dtype=mx.float32)
+
+        tensors = gather_prompt_logprobs(logits, [2], num_logprobs=3)
+
+        assert tensors.logprob_token_ids.shape == (1, 4)
+        assert tensors.logprob_token_ids[0, 0].item() == 2
+        assert sorted(tensors.logprob_token_ids[0, 1:].tolist()) == [0, 1, 2]
+
+    def test_raw_logits_mode_returns_logits_not_logprobs(self) -> None:
+        logits = mx.array([[0.0, 1.0, 2.0]], dtype=mx.float32)
+
+        tensors = gather_prompt_logprobs(
+            logits,
+            [2],
+            num_logprobs=1,
+            logprobs_mode="raw_logits",
+        )
+
+        assert tensors.logprobs[0, 0].item() == pytest.approx(2.0)
+
     def test_rejects_row_count_mismatch(self) -> None:
         with pytest.raises(ValueError, match="num_targets, vocab"):
             gather_prompt_logprobs(mx.zeros((2, 4)), [1], num_logprobs=1)
@@ -140,6 +161,7 @@ class TestPromptLogprobsTracker:
             len(prompt), vocab
         ) * mx.array([0.1])
 
+        tracker.register("req-a", 1)
         first = tracker.observe_chunk(
             "req-a",
             prompt_token_ids=prompt,
@@ -147,6 +169,7 @@ class TestPromptLogprobsTracker:
             num_tokens=3,
             chunk_logits=full_rows[0:3],
             num_logprobs=1,
+            logprobs_mode="raw_logprobs",
         )
         assert first is None
 
@@ -157,6 +180,7 @@ class TestPromptLogprobsTracker:
             num_tokens=3,
             chunk_logits=full_rows[3:6],
             num_logprobs=1,
+            logprobs_mode="raw_logprobs",
         )
         assert final is not None
         # One row per scored prompt position, column 0 is the prompt token.
@@ -168,7 +192,9 @@ class TestPromptLogprobsTracker:
         assert final.selected_token_ranks.tolist() == (
             expected.selected_token_ranks.tolist()
         )
-        # Delivery clears the in-progress slot.
+        # Delivery clears all lifecycle state so decode preemption cannot
+        # re-emit prompt logprobs for the same request.
+        assert not tracker.wants("req-a")
         assert tracker._in_progress == {}
 
     def test_single_chunk_prompt_completes_immediately(self) -> None:
@@ -187,6 +213,7 @@ class TestPromptLogprobsTracker:
             num_tokens=3,
             chunk_logits=rows,
             num_logprobs=0,
+            logprobs_mode="raw_logprobs",
         )
 
         assert tensors is not None
@@ -205,6 +232,7 @@ class TestPromptLogprobsTracker:
             num_tokens=1,
             chunk_logits=mx.zeros((1, 8)),
             num_logprobs=2,
+            logprobs_mode="raw_logprobs",
         )
 
         assert tensors is not None
@@ -222,12 +250,14 @@ class TestPromptLogprobsTracker:
                 num_tokens=3,
                 chunk_logits=mx.zeros((2, 8)),
                 num_logprobs=1,
+                logprobs_mode="raw_logprobs",
             )
 
     def test_discard_drops_in_progress_state(self) -> None:
         from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 
         tracker = PromptLogprobsTracker()
+        tracker.register("req-e", 1)
         tracker.observe_chunk(
             "req-e",
             prompt_token_ids=[1, 2, 3, 4],
@@ -235,21 +265,25 @@ class TestPromptLogprobsTracker:
             num_tokens=2,
             chunk_logits=mx.zeros((2, 8)),
             num_logprobs=1,
+            logprobs_mode="raw_logprobs",
         )
         assert "req-e" in tracker._in_progress
+        assert tracker.wants("req-e")
 
         tracker.discard({"req-e", "never-seen"})
 
+        assert not tracker.wants("req-e")
         assert tracker._in_progress == {}
 
     def test_wants(self) -> None:
-        from vllm.sampling_params import SamplingParams
-
         from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 
-        assert PromptLogprobsTracker.wants(SamplingParams(prompt_logprobs=1))
-        assert not PromptLogprobsTracker.wants(SamplingParams())
-        assert not PromptLogprobsTracker.wants(None)
+        tracker = PromptLogprobsTracker()
+
+        tracker.register("req", 1)
+
+        assert tracker.wants("req")
+        assert not tracker.wants("other")
 
 
 class TestFullPromptLogprobs:
@@ -267,7 +301,12 @@ class TestFullPromptLogprobs:
             dtype=mx.float32,
         )
 
-        tensors = full_prompt_logprobs(rows, prompt, num_logprobs=2)
+        tensors = full_prompt_logprobs(
+            rows,
+            prompt,
+            num_logprobs=2,
+            logprobs_mode="raw_logprobs",
+        )
 
         assert tensors.logprob_token_ids.shape == (3, 3)
         assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
@@ -277,9 +316,36 @@ class TestFullPromptLogprobs:
     def test_one_token_prompt(self) -> None:
         from vllm_metal.v1.prompt_logprobs import full_prompt_logprobs
 
-        tensors = full_prompt_logprobs(mx.zeros((1, 4)), [7], num_logprobs=1)
+        tensors = full_prompt_logprobs(
+            mx.zeros((1, 4)),
+            [7],
+            num_logprobs=1,
+            logprobs_mode="raw_logprobs",
+        )
 
         assert tensors.logprob_token_ids.shape == (0, 2)
+
+    def test_minus_one_resolves_to_full_vocab(self) -> None:
+        from vllm_metal.v1.prompt_logprobs import full_prompt_logprobs
+
+        rows = mx.array(
+            [
+                [0.0, 1.0, 2.0],
+                [2.0, 0.0, 1.0],
+                [9.0, 9.0, 9.0],
+            ],
+            dtype=mx.float32,
+        )
+
+        tensors = full_prompt_logprobs(
+            rows,
+            [0, 1, 2],
+            num_logprobs=-1,
+            logprobs_mode="raw_logprobs",
+        )
+
+        assert tensors.logprob_token_ids.shape == (2, 4)
+        assert sorted(tensors.logprob_token_ids[0, 1:].tolist()) == [0, 1, 2]
 
 
 class TestRunnerWiring:
@@ -354,6 +420,7 @@ class TestRunnerWiring:
         prompt = [3, 1, 4, 1, 5, 9]
         vocab = 16
         params = SamplingParams(temperature=0, prompt_logprobs=1)
+        runner._prompt_logprobs_tracker.register("req-p", 1)
 
         def _prefill(start: int, end: int, prompt_len: int | None):
             return mr.PrefillRequest(
@@ -382,6 +449,16 @@ class TestRunnerWiring:
         assert tensors.logprob_token_ids.shape == (len(prompt) - 1, 2)
         assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
 
+        replay = mr._ExecutionBatch()
+        runner._gather_prefill_prompt_logprobs(
+            replay,
+            [_prefill(0, len(prompt), len(prompt))],
+            mx.zeros((1, len(prompt), vocab)),
+            [0, len(prompt)],
+            0,
+        )
+        assert replay.prompt_logprobs_dict == {}
+
     def test_paged_gather_rejects_pruned_segment_rows(self) -> None:
         from vllm.sampling_params import SamplingParams
 
@@ -400,6 +477,7 @@ class TestRunnerWiring:
             full_prompt_token_ids=prompt,
         )
         batch = mr._ExecutionBatch()
+        runner._prompt_logprobs_tracker.register("req-q", 1)
 
         # A selective-logits layout would leave one row per prefill segment.
         with pytest.raises(RuntimeError, match="selective-logits"):
@@ -424,6 +502,7 @@ class TestRunnerWiring:
             full_prompt_token_ids=None,
         )
         batch = mr._ExecutionBatch()
+        runner._prompt_logprobs_tracker.register("req-r", 1)
 
         with pytest.raises(RuntimeError, match="full prompt"):
             runner._gather_prefill_prompt_logprobs(

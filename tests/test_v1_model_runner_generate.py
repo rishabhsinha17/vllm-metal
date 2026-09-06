@@ -2629,9 +2629,10 @@ class TestPipelineGateSpecDecodeDerivation:
         )
 
     def test_prompt_logprobs_request_disables_pipeline(self) -> None:
-        # Arrange — a decode-phase request asking for prompt logprobs must
-        # keep the synchronous sample path (logprobs need eager logits).
+        # Arrange — an active prompt-logprobs request must keep the synchronous
+        # sample path until the prompt scores are delivered.
         runner = self._runner(drafter=None)
+        runner._prompt_logprobs_tracker.register("r0", 5)
         runner._request_states = {
             "r0": mr.RequestState(
                 token_ids=[1, 7],
