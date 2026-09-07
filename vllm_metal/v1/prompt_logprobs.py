@@ -49,7 +49,7 @@ class PromptLogprobsWindow:
 
 
 def prompt_logprobs_window(
-    *, start_pos: int, num_tokens: int, prompt_len: int
+    start_pos: int, num_tokens: int, prompt_len: int
 ) -> PromptLogprobsWindow:
     """Mirror of vLLM's ``_get_prompt_logprobs_dict`` chunk accounting."""
     num_remaining = prompt_len - (start_pos + 1)
@@ -115,7 +115,6 @@ class PromptLogprobsTracker:
     def observe_chunk(
         self,
         req_id: str,
-        *,
         prompt_token_ids: list[int],
         start_pos: int,
         num_tokens: int,
@@ -175,7 +174,6 @@ def full_prompt_logprobs(
     logits_rows: mx.array,
     prompt_token_ids: list[int],
     num_logprobs: int,
-    *,
     logprobs_mode: str,
 ) -> LogprobsTensors:
     """One-shot prompt logprobs when the whole prompt ran in one forward.
@@ -212,7 +210,6 @@ def gather_prompt_logprobs(
     logits_rows: mx.array,
     target_token_ids: list[int],
     num_logprobs: int,
-    *,
     logprobs_mode: str = "raw_logprobs",
 ) -> LogprobsTensors:
     """Score ``target_token_ids`` against ``logits_rows`` (one row per target).
