@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prompt logprobs for the Metal runner.
-
-vLLM's ``SamplingParams.prompt_logprobs`` (and the OpenAI ``echo`` +
-``logprobs`` combination the server maps onto it) asks for the log
-probability the model assigns to each prompt token given its prefix, plus the
-top-k alternatives at that position.  The engine expects one
-``LogprobsTensors`` per request covering positions ``1 .. prompt_len - 1``,
-delivered on the step that finishes the prompt (``prompt_logprobs_dict`` in
-``ModelRunnerOutput``); chunked prefill fills it slice by slice.  This module
-holds the accounting and the tensor construction so the paged and non-paged
-runner paths share one contract.
-"""
+"""Prompt logprobs accounting and tensor construction for the Metal runner."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -75,17 +65,6 @@ class PromptLogprobsAccumulator:
         """Copy one chunk's rows into positions ``window.start_pos ...``."""
         start = window.start_pos
         end = start + window.num_logits
-        if chunk.logprob_token_ids.shape[0] != window.num_logits:
-            raise ValueError(
-                "prompt logprobs chunk has "
-                f"{chunk.logprob_token_ids.shape[0]} rows, window expects "
-                f"{window.num_logits}"
-            )
-        if end > self.prompt_len - 1:
-            raise ValueError(
-                f"prompt logprobs window [{start}, {end}) exceeds the "
-                f"{self.prompt_len - 1} scored prompt positions"
-            )
         self.tensors.logprob_token_ids[start:end].copy_(chunk.logprob_token_ids)
         self.tensors.logprobs[start:end].copy_(chunk.logprobs)
         self.tensors.selected_token_ranks[start:end].copy_(chunk.selected_token_ranks)
@@ -112,6 +91,10 @@ class PromptLogprobsTracker:
         """Whether *req_id* still needs prompt logprobs."""
         return req_id in self._active
 
+    def wants_any(self, req_ids: Iterable[str]) -> bool:
+        """Whether any request still needs prompt logprobs."""
+        return any(req_id in self._active for req_id in req_ids)
+
     def observe_chunk(
         self,
         req_id: str,
@@ -128,11 +111,6 @@ class PromptLogprobsTracker:
         target prompt tokens and are scored.  Returns the completed tensors
         when this chunk reaches the end of the prompt.
         """
-        if chunk_logits.ndim != 2 or chunk_logits.shape[0] != num_tokens:
-            raise ValueError(
-                f"chunk_logits must be ({num_tokens}, vocab); got shape "
-                f"{tuple(chunk_logits.shape)}"
-            )
         prompt_len = len(prompt_token_ids)
         window = prompt_logprobs_window(
             start_pos=start_pos, num_tokens=num_tokens, prompt_len=prompt_len

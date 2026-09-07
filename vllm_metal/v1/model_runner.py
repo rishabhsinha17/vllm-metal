@@ -278,6 +278,17 @@ class _ExecutionBatch:
         """Return whether this step has any paged execution work."""
         return bool(self.paged_prefill_entries or self.paged_decode_reqs)
 
+    def to_model_runner_output(self) -> ModelRunnerOutput:
+        """Build ``ModelRunnerOutput`` from this completed batch."""
+        return ModelRunnerOutput(
+            req_ids=self.req_ids,
+            req_id_to_index=self.req_id_to_index,
+            sampled_token_ids=self.sampled_tokens,
+            logprobs=self.merged_logprobs(),
+            prompt_logprobs_dict=dict(self.prompt_logprobs_dict),
+            pooler_output=self.pooler_outputs,
+        )
+
     def decoder_pooling_batch(
         self,
         cu_seqlens: list[int],
@@ -471,7 +482,7 @@ class MetalModelRunner:
         # Gate-eligible pure-decode greedy steps defer the sampling sync one
         # step so the next step's graph build overlaps the in-flight forward.
         self._decode_pipeline = DecodePipeline(
-            build_output=self._build_output,
+            build_output=_ExecutionBatch.to_model_runner_output,
             validate=self._validate_scheduled_outputs,
         )
 
@@ -1466,9 +1477,8 @@ class MetalModelRunner:
                 # position, so their steps skip both head-pruning paths: the
                 # projection-free intermediate forward (no logits at all) and
                 # the selective layout (last prefill row only).
-                needs_prompt_logprob_rows = any(
-                    self._prompt_logprobs_tracker.wants(pr.req_id)
-                    for pr in prefill_reqs
+                needs_prompt_logprob_rows = self._prompt_logprobs_tracker.wants_any(
+                    pr.req_id for pr in prefill_reqs
                 )
                 if (
                     intermediate_only
@@ -1614,9 +1624,7 @@ class MetalModelRunner:
                 and not states_missing
                 and SamplingBatch.params_allow_native_random(decode_params)
             ),
-            has_prompt_logprobs=any(
-                self._prompt_logprobs_tracker.wants(req_id) for req_id in decode_req_ids
-            ),
+            has_prompt_logprobs=self._prompt_logprobs_tracker.wants_any(decode_req_ids),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
 
@@ -2671,18 +2679,6 @@ class MetalModelRunner:
 
         return prefill_pack
 
-    @staticmethod
-    def _build_output(batch: _ExecutionBatch) -> ModelRunnerOutput:
-        """Build ``ModelRunnerOutput`` from a completed batch."""
-        return ModelRunnerOutput(
-            req_ids=batch.req_ids,
-            req_id_to_index=batch.req_id_to_index,
-            sampled_token_ids=batch.sampled_tokens,
-            logprobs=batch.merged_logprobs(),
-            prompt_logprobs_dict=dict(batch.prompt_logprobs_dict),
-            pooler_output=batch.pooler_outputs,
-        )
-
     def _run_encoder_pooling_batch(
         self,
         scheduler_output: SchedulerOutput,
@@ -2696,7 +2692,7 @@ class MetalModelRunner:
         ):
             batch.add_output(output.req_id, [], None, output.pooler_output)
         self._validate_scheduled_outputs(batch, scheduler_output)
-        return self._build_output(batch)
+        return batch.to_model_runner_output()
 
     def _run_non_paged_decode_batch(self, batch: _ExecutionBatch) -> None:
         """Run non-paged decode work."""
@@ -2928,7 +2924,7 @@ class MetalModelRunner:
                 if runtime is not None:
                     runtime.materialize_pending_state()
                 self._validate_scheduled_outputs(batch, scheduler_output)
-                return self._build_output(batch)
+                return batch.to_model_runner_output()
             return None
 
         # Defensive invariant: the vLLM scheduler sets has_structured_output_requests
@@ -2955,8 +2951,8 @@ class MetalModelRunner:
             runtime.materialize_pending_state()
         self._validate_scheduled_outputs(batch, scheduler_output)
         if not batch.req_ids:
-            return self._build_output(batch)
-        output = self._build_output(batch)
+            return batch.to_model_runner_output()
+        output = batch.to_model_runner_output()
         if self._is_pooling:
             return output
         self._pending_output = output
@@ -2998,7 +2994,7 @@ class MetalModelRunner:
             if runtime is not None:
                 runtime.materialize_pending_state()
             self._validate_scheduled_outputs(batch, scheduler_output)
-            return self._build_output(batch)
+            return batch.to_model_runner_output()
 
         # Non-paged path: return output built by execute_model
         if self._pending_output is not None:

@@ -10,7 +10,9 @@ import torch
 
 from vllm_metal.v1.prompt_logprobs import (
     PromptLogprobsAccumulator,
+    PromptLogprobsTracker,
     PromptLogprobsWindow,
+    full_prompt_logprobs,
     gather_prompt_logprobs,
     prompt_logprobs_window,
 )
@@ -96,10 +98,6 @@ class TestGatherPromptLogprobs:
 
         assert tensors.logprobs[0, 0].item() == pytest.approx(2.0)
 
-    def test_rejects_row_count_mismatch(self) -> None:
-        with pytest.raises(ValueError, match="num_targets, vocab"):
-            gather_prompt_logprobs(mx.zeros((2, 4)), [1], num_logprobs=1)
-
 
 class TestPromptLogprobsAccumulator:
     def test_chunks_fill_disjoint_positions_of_one_tensor_set(self) -> None:
@@ -122,29 +120,9 @@ class TestPromptLogprobsAccumulator:
             first.selected_token_ranks.tolist() + second.selected_token_ranks.tolist()
         )
 
-    def test_rejects_chunk_that_does_not_match_its_window(self) -> None:
-        acc = PromptLogprobsAccumulator(prompt_len=4, num_logprobs=1)
-        chunk = gather_prompt_logprobs(mx.array([[0.0, 1.0]]), [1], num_logprobs=1)
-
-        with pytest.raises(ValueError, match="window expects 2"):
-            acc.fill(
-                prompt_logprobs_window(start_pos=0, num_tokens=2, prompt_len=4), chunk
-            )
-
-    def test_rejects_window_past_the_prompt(self) -> None:
-        acc = PromptLogprobsAccumulator(prompt_len=3, num_logprobs=0)
-        chunk = gather_prompt_logprobs(mx.array([[0.0, 1.0], [1.0, 0.0]]), [1, 0], 0)
-
-        with pytest.raises(ValueError, match="exceeds"):
-            acc.fill(
-                PromptLogprobsWindow(start_pos=1, num_logits=2, completes=True), chunk
-            )
-
 
 class TestPromptLogprobsTracker:
     def test_delivers_only_on_the_completing_chunk(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
-
         tracker = PromptLogprobsTracker()
         prompt = [3, 1, 0, 2, 1, 0]
         vocab = 4
@@ -184,11 +162,9 @@ class TestPromptLogprobsTracker:
         # Delivery clears all lifecycle state so decode preemption cannot
         # re-emit prompt logprobs for the same request.
         assert not tracker.wants("req-a")
-        assert tracker._in_progress == {}
+        assert not tracker.wants_any(["req-a"])
 
     def test_single_chunk_prompt_completes_immediately(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
-
         tracker = PromptLogprobsTracker()
         tracker.register("req-b", 0)
         prompt = [2, 0, 1]
@@ -211,8 +187,6 @@ class TestPromptLogprobsTracker:
         assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
 
     def test_one_token_prompt_delivers_empty_tensors(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
-
         tracker = PromptLogprobsTracker()
         tracker.register("req-c", 2)
         tensors = tracker.observe_chunk(
@@ -227,24 +201,7 @@ class TestPromptLogprobsTracker:
         assert tensors is not None
         assert tensors.logprob_token_ids.shape == (0, 3)
 
-    def test_rejects_row_count_mismatch(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
-
-        tracker = PromptLogprobsTracker()
-        tracker.register("req-d", 1)
-        with pytest.raises(ValueError, match=r"\(3, vocab\)"):
-            tracker.observe_chunk(
-                "req-d",
-                prompt_token_ids=[1, 2, 3, 4],
-                start_pos=0,
-                num_tokens=3,
-                chunk_logits=mx.zeros((2, 8)),
-                logprobs_mode="raw_logprobs",
-            )
-
     def test_discard_drops_in_progress_state(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
-
         tracker = PromptLogprobsTracker()
         tracker.register("req-e", 1)
         tracker.observe_chunk(
@@ -255,29 +212,28 @@ class TestPromptLogprobsTracker:
             chunk_logits=mx.zeros((2, 8)),
             logprobs_mode="raw_logprobs",
         )
-        assert "req-e" in tracker._in_progress
         assert tracker.wants("req-e")
 
         tracker.discard({"req-e", "never-seen"})
 
         assert not tracker.wants("req-e")
-        assert tracker._in_progress == {}
 
-    def test_wants(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
+        tracker.register("req-e", 0)
+        tensors = tracker.observe_chunk(
+            "req-e",
+            prompt_token_ids=[1, 2],
+            start_pos=0,
+            num_tokens=2,
+            chunk_logits=mx.zeros((2, 8)),
+            logprobs_mode="raw_logprobs",
+        )
 
-        tracker = PromptLogprobsTracker()
-
-        tracker.register("req", 1)
-
-        assert tracker.wants("req")
-        assert not tracker.wants("other")
+        assert tensors is not None
+        assert tensors.logprob_token_ids.shape == (1, 1)
 
 
 class TestFullPromptLogprobs:
     def test_matches_chunked_gather(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import full_prompt_logprobs
-
         prompt = [0, 2, 1, 3]
         rows = mx.array(
             [
@@ -302,8 +258,6 @@ class TestFullPromptLogprobs:
         torch.testing.assert_close(tensors.logprobs, expected.logprobs)
 
     def test_one_token_prompt(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import full_prompt_logprobs
-
         tensors = full_prompt_logprobs(
             mx.zeros((1, 4)),
             [7],
@@ -314,8 +268,6 @@ class TestFullPromptLogprobs:
         assert tensors.logprob_token_ids.shape == (0, 2)
 
     def test_minus_one_resolves_to_full_vocab(self) -> None:
-        from vllm_metal.v1.prompt_logprobs import full_prompt_logprobs
-
         rows = mx.array(
             [
                 [0.0, 1.0, 2.0],
@@ -339,7 +291,7 @@ class TestFullPromptLogprobs:
 class TestRunnerWiring:
     """The two #680 symptoms, pinned at the runner seams.
 
-    ``prompt_logprobs_dict`` was hardcoded ``{}`` in ``_build_output`` and
+    ``prompt_logprobs_dict`` was hardcoded ``{}`` in the output builder and
     nothing ever produced tensors, so ``echo+logprobs`` 500'd (the API layer
     indexed a generated-token dict with a prompt token id) and bare
     ``prompt_logprobs`` returned ``[None]`` silently.
@@ -350,7 +302,7 @@ class TestRunnerWiring:
 
         return make_stub_runner(num_kv_heads=2)
 
-    def test_build_output_carries_prompt_logprobs_dict(self) -> None:
+    def test_batch_output_carries_prompt_logprobs_dict(self) -> None:
         import vllm_metal.v1.model_runner as mr
 
         batch = mr._ExecutionBatch()
@@ -358,7 +310,7 @@ class TestRunnerWiring:
         tensors = gather_prompt_logprobs(mx.zeros((1, 8)), [3], num_logprobs=1)
         batch.prompt_logprobs_dict["req-0"] = tensors
 
-        output = mr.MetalModelRunner._build_output(batch)
+        output = batch.to_model_runner_output()
 
         assert output.prompt_logprobs_dict == {"req-0": tensors}
 

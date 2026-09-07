@@ -130,7 +130,7 @@ def make_stub_runner(
     runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
     if "_decode_pipeline" not in attrs:
         runner._decode_pipeline = DecodePipeline(
-            build_output=runner._build_output,
+            build_output=mr._ExecutionBatch.to_model_runner_output,
             validate=runner._validate_scheduled_outputs,
         )
 
