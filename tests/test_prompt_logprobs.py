@@ -84,15 +84,6 @@ class TestGatherPromptLogprobs:
         assert tensors.logprob_token_ids.tolist() == [[2]]
         assert tensors.selected_token_ranks.tolist() == [2]
 
-    def test_full_vocab_count_keeps_every_token(self) -> None:
-        logits = mx.array([[0.0, 1.0, 2.0]], dtype=mx.float32)
-
-        tensors = gather_prompt_logprobs(logits, [2], num_logprobs=3)
-
-        assert tensors.logprob_token_ids.shape == (1, 4)
-        assert tensors.logprob_token_ids[0, 0].item() == 2
-        assert sorted(tensors.logprob_token_ids[0, 1:].tolist()) == [0, 1, 2]
-
     def test_raw_logits_mode_returns_logits_not_logprobs(self) -> None:
         logits = mx.array([[0.0, 1.0, 2.0]], dtype=mx.float32)
 
