@@ -33,6 +33,13 @@ _MB_BUFFER_MAX_BATCHED_TOKENS = 4096
 # Only the local executors share this process's memory and inherit its
 # environment; Ray workers must not receive a driver-derived value.
 _MB_BUFFER_LOCAL_BACKENDS = ("uni", "mp")
+_METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+_METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
+    dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
+}
 
 
 def _pick_mb_buffer_default(
@@ -112,8 +119,8 @@ class MetalPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get total memory available for the device.
 
-        On Apple Silicon, this returns the fraction of unified memory
-        configured for use by the plugin.
+        On Apple Silicon this is the unified memory size; the paged KV
+        budget carved out of it follows ``--gpu-memory-utilization``.
 
         Args:
             device_id: Device index (ignored for Metal)
@@ -121,12 +128,7 @@ class MetalPlatform(Platform):
         Returns:
             Total memory in bytes
         """
-        config = get_config()
-        total_memory = psutil.virtual_memory().total
-        # In auto mode, report full memory - actual allocation is dynamic
-        if config.is_auto_memory:
-            return total_memory
-        return int(total_memory * config.memory_fraction)
+        return int(psutil.virtual_memory().total)
 
     @classmethod
     def get_device_available_memory(cls, device_id: int = 0) -> int:
@@ -138,12 +140,7 @@ class MetalPlatform(Platform):
         Returns:
             Available memory in bytes
         """
-        config = get_config()
-        available = psutil.virtual_memory().available
-        # In auto mode, report full available memory - actual allocation is dynamic
-        if config.is_auto_memory:
-            return available
-        return int(available * config.memory_fraction)
+        return int(psutil.virtual_memory().available)
 
     @classmethod
     def is_available(cls) -> bool:
@@ -255,7 +252,6 @@ class MetalPlatform(Platform):
         unsupported_controls = [
             name
             for name, enabled in (
-                ("min_p", params.min_p > 0.0),
                 ("logit_bias", bool(params.logit_bias)),
                 ("min_tokens", params.min_tokens > 0),
             )
@@ -386,6 +382,17 @@ class MetalPlatform(Platform):
         # Retry after vLLM is fully imported, before serving tokenizers are built.
         ensure_vllm_bytelevel_tokenizer_patch()
 
+        import vllm.envs as vllm_envs
+
+        # Runs before VllmConfig validates the runner choice, so an explicit
+        # request fails with the Metal constraint, not upstream's Triton check.
+        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+            raise NotImplementedError(
+                "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
+                "MetalWorker implements the V1 model runner contract. Unset it "
+                "(vllm-metal defaults it to 0)."
+            )
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
@@ -464,6 +471,35 @@ class MetalPlatform(Platform):
                 "--additional-config '{\"turboquant\": true}' instead."
             )
 
+        # vLLM accepts quantized KV cache dtypes and logs them as in use, but the
+        # Metal paged KV cache is always stored in the model dtype, so the
+        # requested memory saving would silently never happen. TurboQuant is
+        # Metal's quantized KV cache.
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype != "auto":
+            model_dtype = vllm_config.model_config.dtype
+            model_cache_dtype = _METAL_DENSE_KV_CACHE_DTYPE_NAMES.get(model_dtype)
+            if cache_dtype in _METAL_DENSE_KV_CACHE_DTYPES:
+                if _METAL_DENSE_KV_CACHE_DTYPES[cache_dtype] != model_dtype:
+                    dtype_detail = model_cache_dtype or str(model_dtype)
+                    raise NotImplementedError(
+                        f"vllm-metal does not support --kv-cache-dtype {cache_dtype} "
+                        f"with model dtype {dtype_detail}: the paged KV cache is "
+                        "stored in the model dtype."
+                    )
+            else:
+                dense_dtype_hint = (
+                    f"--kv-cache-dtype {model_cache_dtype}"
+                    if model_cache_dtype is not None
+                    else "--kv-cache-dtype auto"
+                )
+                raise NotImplementedError(
+                    f"vllm-metal does not support --kv-cache-dtype {cache_dtype}: "
+                    "the paged KV cache is stored in the model dtype. Use "
+                    f"{dense_dtype_hint}, or enable TurboQuant with "
+                    "--additional-config '{\"turboquant\": true}'."
+                )
+
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
         # verifies draft ids against the target vocabulary with no mapping.
@@ -522,7 +558,7 @@ class MetalPlatform(Platform):
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
                 )
-            if cache_config.enable_prefix_caching and config.use_paged_attention:
+            if cache_config.enable_prefix_caching:
                 from vllm_metal.attention.runtime.factory import (
                     state_family_for_model_type,
                 )
@@ -540,12 +576,6 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-            if cache_config.enable_prefix_caching and not config.use_paged_attention:
-                cls._disable_hybrid_prefix_caching(
-                    vllm_config,
-                    "the non-paged MLX path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
-                    "has no block-indexed state to restore from",
-                )
             if (
                 cache_config.enable_prefix_caching
                 and vllm_config.speculative_config is not None
@@ -721,42 +751,14 @@ class MetalPlatform(Platform):
             )
 
         if scheduler_config.enable_chunked_prefill:
-            if config.use_paged_attention:
-                # The paged path uses a unified varlen Metal kernel that
-                # handles mixed prefill + decode in a single forward pass,
-                # so chunked prefill works correctly.
-                logger.info(
-                    "Metal: chunked prefill enabled (paged attention), "
-                    "max_num_batched_tokens=%d",
-                    scheduler_config.max_num_batched_tokens,
-                )
-            else:
-                # The non-paged MLX path does not honor chunked-prefill
-                # scheduler boundaries.  Disable so the scheduler only
-                # requests full prefills.
-                scheduler_config.enable_chunked_prefill = False
-
-                # Without chunked prefill, the scheduler must fit the
-                # entire prompt in a single step.  Ensure
-                # max_num_batched_tokens (and max_num_scheduled_tokens)
-                # are at least max_model_len; otherwise the scheduler
-                # silently refuses to schedule any prompt that exceeds
-                # the budget.
-                if model_config is not None:
-                    model_max = model_config.max_model_len
-                    if scheduler_config.max_num_batched_tokens < model_max:
-                        scheduler_config.max_num_batched_tokens = model_max
-                    if (
-                        scheduler_config.max_num_scheduled_tokens is not None
-                        and scheduler_config.max_num_scheduled_tokens < model_max
-                    ):
-                        scheduler_config.max_num_scheduled_tokens = model_max
-
-                logger.info(
-                    "Metal: disabled chunked prefill (non-paged path), "
-                    "max_num_batched_tokens=%d",
-                    scheduler_config.max_num_batched_tokens,
-                )
+            # The paged path uses a unified varlen Metal kernel that
+            # handles mixed prefill + decode in a single forward pass,
+            # so chunked prefill works correctly.
+            logger.info(
+                "Metal: chunked prefill enabled (paged attention), "
+                "max_num_batched_tokens=%d",
+                scheduler_config.max_num_batched_tokens,
+            )
 
         # Disable cascade attention (not supported), then let the adapter
         # apply any model-specific normalisations (e.g. clearing
@@ -924,9 +926,7 @@ class MetalPlatform(Platform):
             return
         desired = _pick_mb_buffer_default(
             total_memory_bytes=psutil.virtual_memory().total,
-            memory_fraction=get_config().effective_memory_fraction(
-                vllm_config.cache_config.gpu_memory_utilization
-            ),
+            memory_fraction=vllm_config.cache_config.gpu_memory_utilization,
             max_num_batched_tokens=(
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),
@@ -956,15 +956,6 @@ class MetalPlatform(Platform):
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
         """
-        from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
-        from vllm_metal.config import get_config
-
-        # Runs in the engine process after vLLM is fully imported, right before
-        # KV sizing: the reliable spot to (re-)install the auto-fit null-block
-        # patch that plugin activation may have skipped mid-import.
-        ensure_vllm_auto_fit_null_block_patch()
-
-        metal_config = get_config()
         model_config = vllm_config.model_config
 
         if not model_config:
@@ -991,7 +982,7 @@ class MetalPlatform(Platform):
         #
         # This is a logical transformation only — the computation is identical, just
         # the kernel sees more, smaller blocks.
-        if model_config.is_hybrid and metal_config.use_paged_attention:
+        if model_config.is_hybrid:
             logger.warning(
                 "Hybrid model with paged attention enabled. "
                 "Using block-size translation (PR #235) to convert vLLM's large "
@@ -1039,12 +1030,7 @@ class MetalPlatform(Platform):
         k_quant = metal_config.k_quant
         v_quant = metal_config.v_quant
 
-        if (
-            not turboquant
-            or not metal_config.use_paged_attention
-            or not model_config
-            or not model_config.is_hybrid
-        ):
+        if not turboquant or not model_config or not model_config.is_hybrid:
             return
 
         from math import lcm

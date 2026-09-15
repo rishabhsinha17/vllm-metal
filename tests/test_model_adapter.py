@@ -931,7 +931,7 @@ class TestYocoCacheIntegration:
         assert block_bytes == expected
 
     def test_backend_uses_compact_layer_count(self) -> None:
-        """Runner backend factory should create MHA backend with reduced num_layers."""
+        """Runner backend factory should create the SDPA backend with reduced num_layers."""
         import mlx.core as mx
 
         from tests.stub_runner import make_stub_runner
@@ -1016,7 +1016,7 @@ class TestRequireUniformKvHeads:
         args = {"num_global_key_value_heads": 2}
         num_kv_heads = 8
         adapter = DefaultModelAdapter()
-        with pytest.raises(ValueError, match="VLLM_METAL_USE_PAGED_ATTENTION=0"):
+        with pytest.raises(ValueError, match="without per-layer shape support"):
             adapter.require_uniform_kv_heads(args, num_kv_heads)
 
 

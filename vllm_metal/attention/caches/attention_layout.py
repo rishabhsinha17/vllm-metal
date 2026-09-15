@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Immutable Metal layout translated from vLLM's standard MHA cache DTOs.
+"""Immutable Metal layout translated from vLLM's standard attention cache DTOs.
 
 vLLM owns KV-cache grouping and capacity planning. This module only validates
 and translates the resulting ``KVCacheConfig`` for the standard mixed
-full/sliding-window MHA path.
+full/sliding-window attention path.
 """
 
 from __future__ import annotations
@@ -18,31 +18,33 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+from vllm_metal.attention.caches.placement import layer_addresses
+
 NO_SLIDING_WINDOW = -1
-StandardMHASpec: TypeAlias = FullAttentionSpec | SlidingWindowSpec
+StandardAttentionSpec: TypeAlias = FullAttentionSpec | SlidingWindowSpec
 
 
 @dataclass(frozen=True, slots=True)
-class MHAGroupLayout:
+class AttentionGroupLayout:
     """vLLM cache-group specs and layer-to-group mapping."""
 
-    specs: tuple[StandardMHASpec, ...]
+    specs: tuple[StandardAttentionSpec, ...]
     layer_indices: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True)
-class MHATensorLayout:
-    """vLLM physical tensor slots and layer-to-slot mapping."""
+class SlotLayout:
+    """vLLM physical slots (distinct region addresses) and layer-to-slot mapping."""
 
     layer_indices: dict[str, int]
     slot_layers: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
-class MHALayerKVLayout:
+class AttentionLayerKVLayout:
     """KV-cache shape and vLLM mapping for one model layer."""
 
-    tensor_index: int
+    slot_index: int
     group_index: int
     block_size: int
     num_kv_heads: int
@@ -55,125 +57,121 @@ class MHALayerKVLayout:
 
 
 @dataclass(frozen=True, slots=True)
-class MHAKVCacheLayout:
-    """Immutable standard-MHA cache layout derived from vLLM's DTOs."""
+class AttentionKVCacheLayout:
+    """Immutable standard attention cache layout derived from vLLM's DTOs."""
 
     num_blocks: int
-    tensor_sizes: tuple[int, ...]
-    layers: tuple[MHALayerKVLayout, ...]
+    allocation_bytes: int
+    layers: tuple[AttentionLayerKVLayout, ...]
     group_block_sizes: tuple[int, ...]
     slot_layers: tuple[tuple[int, ...], ...]
 
     @property
     def total_bytes(self) -> int:
-        """Return the aggregate storage vLLM allocated for KV tensors."""
-        return sum(self.tensor_sizes)
+        """Return the backing allocation vLLM planned for the KV tensors."""
+        return self.allocation_bytes
 
     @classmethod
     def from_config(
         cls, config: KVCacheConfig, model_layer_names: tuple[str, ...]
-    ) -> MHAKVCacheLayout:
-        """Translate a standard mixed-MHA ``KVCacheConfig`` without regrouping.
+    ) -> AttentionKVCacheLayout:
+        """Translate a standard mixed-attention ``KVCacheConfig`` without regrouping.
 
         ``model_layer_names`` is the runner's ordered attention-layer sequence.
-        Each layer must occur exactly once in vLLM's group and tensor mappings.
+        Each layer must occur exactly once in vLLM's group and slot mappings.
         """
-        return MHAKVCacheLayoutTranslator(config, model_layer_names).translate()
+        return AttentionKVCacheLayoutTranslator(config, model_layer_names).translate()
 
 
 @dataclass(frozen=True, slots=True)
-class MHAKVCacheLayoutTranslator:
-    """Translate vLLM's standard-MHA KV cache config into Metal's layout DTO."""
+class AttentionKVCacheLayoutTranslator:
+    """Translate vLLM's standard attention KV cache config into Metal's layout DTO."""
 
     config: KVCacheConfig
     model_layer_names: tuple[str, ...]
 
-    def translate(self) -> MHAKVCacheLayout:
+    def translate(self) -> AttentionKVCacheLayout:
         """Translate without changing vLLM's grouping."""
         group_layout = self._group_layout()
         self._require_model_layers(group_layout.layer_indices, "group")
 
-        tensor_layout = self._tensor_layout(group_layout)
-        self._require_model_layers(tensor_layout.layer_indices, "tensor")
+        slot_layout = self._slot_layout(group_layout)
+        self._require_model_layers(slot_layout.layer_indices, "slot")
 
-        return MHAKVCacheLayout(
+        return AttentionKVCacheLayout(
             num_blocks=self.config.num_blocks,
-            tensor_sizes=tuple(tensor.size for tensor in self.config.kv_cache_tensors),
-            layers=self._layer_layouts(group_layout, tensor_layout),
+            allocation_bytes=self.config.kv_cache_tensors[0].size,
+            layers=self._layer_layouts(group_layout, slot_layout),
             group_block_sizes=tuple(spec.block_size for spec in group_layout.specs),
-            slot_layers=tensor_layout.slot_layers,
+            slot_layers=slot_layout.slot_layers,
         )
 
     @property
     def _model_layer_indices(self) -> dict[str, int]:
         return {name: index for index, name in enumerate(self.model_layer_names)}
 
-    def _group_layout(self) -> MHAGroupLayout:
-        specs: list[StandardMHASpec] = []
+    def _group_layout(self) -> AttentionGroupLayout:
+        specs: list[StandardAttentionSpec] = []
         layer_indices: dict[str, int] = {}
         for group_index, group in enumerate(self.config.kv_cache_groups):
             spec = group.kv_cache_spec
             if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
                 raise NotImplementedError(
-                    "standard MHA layout requires FullAttentionSpec or "
+                    "standard attention layout requires FullAttentionSpec or "
                     "SlidingWindowSpec groups"
                 )
             if spec.head_size_v != spec.head_size:
                 raise NotImplementedError(
-                    "standard MHA layout requires matching key and value head sizes"
+                    "standard attention layout requires matching key and value "
+                    "head sizes"
                 )
 
             specs.append(spec)
             for layer_name in group.layer_names:
                 layer_indices[layer_name] = group_index
-        return MHAGroupLayout(specs=tuple(specs), layer_indices=layer_indices)
+        return AttentionGroupLayout(specs=tuple(specs), layer_indices=layer_indices)
 
-    def _tensor_layout(self, group_layout: MHAGroupLayout) -> MHATensorLayout:
+    def _slot_layout(self, group_layout: AttentionGroupLayout) -> SlotLayout:
         layer_indices: dict[str, int] = {}
-        slot_layers: list[tuple[int, ...]] = []
+        slot_layers: list[list[int]] = []
+        slot_by_address: dict[int, int] = {}
         model_layer_indices = self._model_layer_indices
 
         for tensor_index, tensor in enumerate(self.config.kv_cache_tensors):
-            if tensor.offset != 0 or tensor.block_stride != 0:
-                raise NotImplementedError(
-                    "standard MHA layout does not support KV tensors with "
-                    "offset and block_stride"
-                )
+            spec = group_layout.specs[group_layout.layer_indices[tensor.layers[0]]]
+            self._require_layer_outermost(tensor, tensor_index, spec)
+            for layer_name, address in layer_addresses(tensor):
+                slot = slot_by_address.setdefault(address, len(slot_layers))
+                if slot == len(slot_layers):
+                    slot_layers.append([])
+                layer_indices[layer_name] = slot
+                slot_layers[slot].append(model_layer_indices[layer_name])
 
-            tensor_layer_indices: list[int] = []
-            for layer_name in tensor.shared_by:
-                group_index = group_layout.layer_indices[layer_name]
-                group_spec = group_layout.specs[group_index]
-                self._require_tensor_size(tensor, tensor_index, group_spec, layer_name)
-                layer_indices[layer_name] = tensor_index
-                tensor_layer_indices.append(model_layer_indices[layer_name])
-            slot_layers.append(tuple(tensor_layer_indices))
-
-        return MHATensorLayout(
+        return SlotLayout(
             layer_indices=layer_indices,
-            slot_layers=tuple(slot_layers),
+            slot_layers=tuple(tuple(layers) for layers in slot_layers),
         )
 
     def _layer_layouts(
         self,
-        group_layout: MHAGroupLayout,
-        tensor_layout: MHATensorLayout,
-    ) -> tuple[MHALayerKVLayout, ...]:
+        group_layout: AttentionGroupLayout,
+        slot_layout: SlotLayout,
+    ) -> tuple[AttentionLayerKVLayout, ...]:
         return tuple(
-            self._layer_layout(layer_name, group_layout, tensor_layout)
+            self._layer_layout(layer_name, group_layout, slot_layout)
             for layer_name in self.model_layer_names
         )
 
     def _layer_layout(
         self,
         layer_name: str,
-        group_layout: MHAGroupLayout,
-        tensor_layout: MHATensorLayout,
-    ) -> MHALayerKVLayout:
+        group_layout: AttentionGroupLayout,
+        slot_layout: SlotLayout,
+    ) -> AttentionLayerKVLayout:
         group_index = group_layout.layer_indices[layer_name]
         spec = group_layout.specs[group_index]
-        return MHALayerKVLayout(
-            tensor_index=tensor_layout.layer_indices[layer_name],
+        return AttentionLayerKVLayout(
+            slot_index=slot_layout.layer_indices[layer_name],
             group_index=group_index,
             block_size=spec.block_size,
             num_kv_heads=spec.num_kv_heads,
@@ -192,17 +190,17 @@ class MHAKVCacheLayoutTranslator:
                 "model_layer_names"
             )
 
-    def _require_tensor_size(
-        self,
-        tensor: KVCacheTensor,
-        tensor_index: int,
-        group_spec: StandardMHASpec,
-        layer_name: str,
+    def _require_layer_outermost(
+        self, tensor: KVCacheTensor, tensor_index: int, spec: StandardAttentionSpec
     ) -> None:
-        expected_size = self.config.num_blocks * group_spec.page_size_bytes
-        if tensor.size != expected_size:
-            raise ValueError(
-                f"KV cache tensor {tensor_index} size {tensor.size} does not "
-                f"match {self.config.num_blocks} blocks of "
-                f"{group_spec.page_size_bytes} bytes for layer {layer_name!r}"
+        region_bytes = self.config.num_blocks * spec.page_size_bytes
+        if (
+            tensor.block_stride != spec.page_size_bytes
+            or tensor.layer_stride != region_bytes
+        ):
+            raise NotImplementedError(
+                "standard attention layout requires layer-outermost KV tensors "
+                f"(block_stride {spec.page_size_bytes}, layer_stride "
+                f"{region_bytes}); tensor {tensor_index} has block_stride "
+                f"{tensor.block_stride}, layer_stride {tensor.layer_stride}"
             )
